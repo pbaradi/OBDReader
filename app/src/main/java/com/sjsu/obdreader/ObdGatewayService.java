@@ -8,29 +8,27 @@ import android.bluetooth.BluetoothSocket;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.location.Location;
 import android.location.LocationManager;
 import android.os.Binder;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.support.v4.app.ActivityCompat;
 import android.util.Log;
 
 import com.github.pires.obd.commands.SpeedObdCommand;
 import com.github.pires.obd.commands.control.DistanceTraveledSinceCodesClearedObdCommand;
+import com.github.pires.obd.commands.engine.EngineFuelRate;
 import com.github.pires.obd.commands.engine.EngineOilTempObdCommand;
 import com.github.pires.obd.commands.engine.EngineRPMObdCommand;
+import com.github.pires.obd.commands.engine.EngineRuntimeObdCommand;
 import com.github.pires.obd.commands.fuel.FuelConsumptionRateObdCommand;
 import com.github.pires.obd.commands.fuel.FuelLevelObdCommand;
-import com.github.pires.obd.commands.protocol.EchoOffObdCommand;
-import com.github.pires.obd.commands.protocol.LineFeedOffObdCommand;
-import com.github.pires.obd.commands.protocol.ObdResetCommand;
-import com.github.pires.obd.commands.protocol.SelectProtocolObdCommand;
-import com.github.pires.obd.commands.protocol.TimeoutObdCommand;
 import com.github.pires.obd.commands.temperature.AmbientAirTemperatureObdCommand;
 import com.github.pires.obd.commands.temperature.EngineCoolantTemperatureObdCommand;
-import com.github.pires.obd.enums.ObdProtocols;
 import com.github.pires.obd.exceptions.UnsupportedCommandException;
 import com.sjsu.obdreader.db.VehicleDataSource;
-import com.sjsu.obdreader.model.Vehicle;
+import com.sjsu.obdreader.model.VehicleLog;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
@@ -38,60 +36,37 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.UUID;
 
 public class ObdGatewayService extends Service {
+
     private static final String TAG = ObdGatewayService.class.getName();
     private static final UUID MY_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
-
+    private static final int LOCATION_INTERVAL = 30000;
+    private static final float LOCATION_DISTANCE = 0f;
+    public static boolean isConnected = false;
     public final String OBD_ADDRESS = "00:1D:A5:00:05:F7";
     private final IBinder binder = new MyBinder();
-    private Map<Class, ObdCommandJob> executedCommands = new HashMap<>();
+    boolean found = false;
+    private Map<Class, ObdCommandJob> executedCommands;
     private VehicleDataSource dataSource;
     private BluetoothDevice dev = null;
     private BluetoothSocket socket;
     private BluetoothSocket sockFallback = null;
     private ArrayList<ObdCommandJob> obdCommands = new ArrayList();
-//    private Thread t = new Thread(new Runnable() {
-//        @Override
-//        public void run() {
-//            try {
-//                Log.i(TAG, "executing list");
-//                executeList();
-//            } catch (InterruptedException e) {
-//                t.interrupt();
-//            }
-//        }
-//    });
+    private Timer timer;
+    private LocationManager locationManager;
     private boolean isRunning = false;
-    private Long queueCounter = 0L;
-
+    private MyLocationListener[] locationListener = {new MyLocationListener(LocationManager.GPS_PROVIDER),
+            new MyLocationListener(LocationManager.NETWORK_PROVIDER)};
+    private Location location;
+    private boolean isGpsEnabled = false;
+    private boolean isNetworkEnabled = false;
+    private MQTTHelper mqttHelper;
 
     public ObdGatewayService() {
-    }
-
-    public boolean isRunning() {
-        return isRunning;
-    }
-
-    protected synchronized void putResult(Class commandClass, ObdCommandJob commandInstance) {
-        executedCommands.put(commandClass, commandInstance);
-    }
-
-    public synchronized ObdCommandJob getResult(Class commandClass) {
-        return executedCommands.get(commandClass);
-    }
-
-    public void add(ObdCommandJob job) {
-        if (!isRunning) return;
-
-        queueCounter++;
-        Log.d(TAG, "Adding job[" + queueCounter + "] to queue..");
-
-        job.setId(queueCounter);
-        obdCommands.add(job);
-        Log.d(TAG, "Job queued successfully.");
-
     }
 
     @Override
@@ -104,16 +79,51 @@ public class ObdGatewayService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "Starting Service");
         dataSource = new VehicleDataSource(this);
-        dataSource.open();
+        setCurrentLocation();
+        if (isConnected) {
+            mqttHelper = new MQTTHelper(getApplicationContext());
+        }
+
         try {
             connectObdDevice();
+
+            Log.i(TAG, "Service started");
+            timer = new Timer();
+            timer.schedule(new TimerTask() {
+                @Override
+                public void run() {
+                    if (found) {
+                        Log.i(TAG, "VehicleLog Log");
+                        VehicleLog vehicleLog = new VehicleLog();
+                        try {
+                            executeList();
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        if (executedCommands.size() > 0) {
+                            makeVehicle(vehicleLog);
+                            if (isConnected) {
+                                if (mqttHelper == null)
+                                    mqttHelper = new MQTTHelper(getApplicationContext());
+                                mqttHelper.publishData(vehicleLog);
+                                dataSource.close();
+                            } else {
+                                saveData(vehicleLog);
+                            }
+                        }
+                    }else{
+                        try {
+                            connectObdDevice();
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }, 0, 10000);
         } catch (IOException e) {
             e.printStackTrace();
+            stopService();
         }
-        Log.i(TAG, "Service started");
-        //t.start();
-        VehicleLogThread vt = new VehicleLogThread();
-        vt.start();
         return START_STICKY;
     }
 
@@ -126,13 +136,15 @@ public class ObdGatewayService extends Service {
 
     private void connectObdDevice() throws IOException {
         final BluetoothAdapter btAdapter = BluetoothAdapter.getDefaultAdapter();
-        boolean found = false;
+        found = false;
 
         Set<BluetoothDevice> pairedDevices = btAdapter.getBondedDevices();
         if (pairedDevices.size() > 0) {
             for (BluetoothDevice device : pairedDevices) {
                 if (device.getAddress().equals(OBD_ADDRESS)) {
                     found = true;
+                } else {
+                    found = false;
                 }
             }
         }
@@ -156,33 +168,38 @@ public class ObdGatewayService extends Service {
         obdCommands.clear();
         isRunning = false;
         dataSource.close();
-        if (socket != null)
+        if (socket != null) {
             try {
                 socket.close();
             } catch (IOException e) {
                 Log.e(TAG, e.getMessage());
             }
+        }
+        if (locationManager != null) {
+            try {
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                    for (int i = 0; i < locationListener.length; i++) {
+                        locationManager.removeUpdates(locationListener[i]);
+                    }
+                }
+
+            } catch (Exception ex) {
+                Log.i(TAG, "fail to remove location listeners, ignore", ex);
+            }
+        }
+
         stopSelf();
-    }
-
-
-    public BluetoothSocket getSocket() {
-        return socket;
     }
 
     private void executeList() throws InterruptedException {
         Log.i(TAG, "Executing list...");
+        executedCommands = new HashMap<>();
 
         Log.i(TAG, "List size is " + obdCommands.size());
         for (ObdCommandJob job : obdCommands) {
-
             try {
-                if (job.getState().equals(ObdCommandJobState.NEW)) {
-                    job.setState(ObdCommandJobState.RUNNING);
-                    job.getCommand().run(socket.getInputStream(), socket.getOutputStream());
-                    Log.d(TAG, "Job result" + job.getCommand().getFormattedResult());
-                } else
-                    Log.e(TAG, "Job state was not new, so it shouldn't be in list. BUG ALERT!");
+                job.getCommand().run(socket.getInputStream(), socket.getOutputStream());
+                Log.d(TAG, "Job result" + job.getCommand().getFormattedResult());
             } catch (InterruptedException i) {
                 Log.d(TAG, "InterruptedException -> " + i.getMessage());
                 Thread.currentThread().interrupt();
@@ -199,72 +216,78 @@ public class ObdGatewayService extends Service {
             }
 
             if (job != null) {
-                putResult(job.getCommand().getClass(), job);
+                executedCommands.put(job.getCommand().getClass(), job);
             }
         }
-
-
     }
 
-    private void makeVehicle(Vehicle vehicle) {
-        LocationService locationService = new LocationService();
-        vehicle.setRpm(getResult(EngineRPMObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setSpeed(getResult(SpeedObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setTemperature(getResult(AmbientAirTemperatureObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setTimestamp(CommonUtil.getCurrentDate());
-        vehicle.setFuelLevel(getResult(FuelLevelObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setMileage(getResult(FuelConsumptionRateObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setMiles(getResult(DistanceTraveledSinceCodesClearedObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setOilLevel(getResult(EngineOilTempObdCommand.class).getCommand().getFormattedResult());
-        vehicle.setEngineCoolantTemp(getResult(EngineCoolantTemperatureObdCommand.class).getCommand().getFormattedResult());
-        setCurrentLocation(vehicle);
-//        vehicle.setLongitude(locationService.getLongitude());
-//        vehicle.setLatitude(locationService.getLatitude());
+    private void makeVehicle(VehicleLog vehicleLog) {
+
+        vehicleLog.setRpm(executedCommands.get(EngineRPMObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setSpeed(executedCommands.get(SpeedObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setTemperature(executedCommands.get(AmbientAirTemperatureObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setTimestamp(CommonUtil.getCurrentDate());
+        vehicleLog.setFuelLevel(executedCommands.get(FuelLevelObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setMileage(executedCommands.get(FuelConsumptionRateObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setMiles(executedCommands.get(DistanceTraveledSinceCodesClearedObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setOilLevel(executedCommands.get(EngineOilTempObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setEngineCoolantTemp(executedCommands.get(EngineCoolantTemperatureObdCommand.class).getCommand().getFormattedResult());
+        vehicleLog.setLongitude(location.getLongitude());
+        vehicleLog.setLatitude(location.getLatitude());
+        vehicleLog.setVehicleId(OBD_ADDRESS);
     }
 
-    public void saveData(Vehicle vehicle) {
+    public void saveData(VehicleLog vehicleLog) {
         Log.i(TAG, "Saving data to sql lite");
 
-        if (dataSource.insert(vehicle))
-            Log.i(TAG, "Vehicle data saved successfully");
+        if (dataSource.insert(vehicleLog))
+            Log.i(TAG, "VehicleLog data saved successfully");
         else
-            Log.i(TAG, "Vehicle data cannot be saved");
+            Log.i(TAG, "VehicleLog data cannot be saved");
 
     }
 
-    private void setCurrentLocation(Vehicle vehicle) {
-        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+    private void setCurrentLocation() {
+        Log.i(TAG, "initializeLocationManager");
+        if (locationManager == null) {
+            locationManager = (LocationManager) getApplicationContext().getSystemService(Context.LOCATION_SERVICE);
+        }
 
-        LocationService locationListener = new LocationService();
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             Log.i(TAG, "Location not found");
         } else {
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, locationListener);
+            try {
+
+                isGpsEnabled = locationManager
+                        .isProviderEnabled(LocationManager.GPS_PROVIDER);
+                // getting network status
+                isNetworkEnabled = locationManager
+                        .isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+
+                if (isGpsEnabled) {
+
+                    locationManager.requestLocationUpdates(
+                            LocationManager.GPS_PROVIDER, LOCATION_INTERVAL, LOCATION_DISTANCE,
+                            locationListener[0]);
+                    location = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                }
+                if (isNetworkEnabled) {
+                    locationManager.requestLocationUpdates(
+                            LocationManager.NETWORK_PROVIDER, LOCATION_INTERVAL, LOCATION_DISTANCE,
+                            locationListener[1]);
+                    location = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                }
+            } catch (java.lang.SecurityException ex) {
+                Log.i(TAG, "fail to request location update, ignore", ex);
+            } catch (IllegalArgumentException ex) {
+                Log.d(TAG, "gps provider does not exist " + ex.getMessage());
+            }
         }
-        vehicle.setLatitude(locationListener.getLatitude());
-        vehicle.setLongitude(locationListener.getLongitude());
     }
 
     public class MyBinder extends Binder {
         ObdGatewayService getService() {
             return ObdGatewayService.this;
-        }
-    }
-
-    private class VehicleLogThread extends Thread{
-        @Override
-        public void run() {
-            Log.i(TAG,"Vehicle Log");
-            Vehicle vehicle = new Vehicle();
-            try {
-                executeList();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            if (executedCommands.size() > 0) {
-                makeVehicle(vehicle);
-                saveData(vehicle);
-            }
         }
     }
 
@@ -298,24 +321,59 @@ public class ObdGatewayService extends Service {
             if (isRunning) {
                 // Let's configure the connection.
                 Log.d(TAG, "Adding jobs for connection configuration to list..");
-                add(new ObdCommandJob(new ObdResetCommand()));
-                add(new ObdCommandJob(new EchoOffObdCommand()));
-                add(new ObdCommandJob(new LineFeedOffObdCommand()));
-                add(new ObdCommandJob(new TimeoutObdCommand(62)));
-                final String protocol = "AUTO";
-                add(new ObdCommandJob(new SelectProtocolObdCommand(ObdProtocols.valueOf(protocol))));
+//                obdCommands.add(new ObdCommandJob(new ObdResetCommand()));
+//                obdCommands.add(new ObdCommandJob(new EchoOffObdCommand()));
+//                obdCommands.add(new ObdCommandJob(new LineFeedOffObdCommand()));
+//                obdCommands.add(new ObdCommandJob(new TimeoutObdCommand(62)));
+//                final String protocol = "AUTO";
+//                obdCommands.add(new ObdCommandJob(new SelectProtocolObdCommand(ObdProtocols.valueOf(protocol))));
 
-                add(new ObdCommandJob(new AmbientAirTemperatureObdCommand()));
-                add(new ObdCommandJob(new EngineRPMObdCommand()));
-                add(new ObdCommandJob(new SpeedObdCommand()));
-                add(new ObdCommandJob(new EngineCoolantTemperatureObdCommand()));
-                add(new ObdCommandJob(new EngineOilTempObdCommand()));
-                add(new ObdCommandJob(new FuelLevelObdCommand()));
-                add(new ObdCommandJob(new DistanceTraveledSinceCodesClearedObdCommand()));
-                add(new ObdCommandJob(new FuelConsumptionRateObdCommand()));
+                obdCommands.add(new ObdCommandJob(new AmbientAirTemperatureObdCommand()));
+                obdCommands.add(new ObdCommandJob(new EngineRPMObdCommand()));
+                obdCommands.add(new ObdCommandJob(new SpeedObdCommand()));
+                obdCommands.add(new ObdCommandJob(new EngineCoolantTemperatureObdCommand()));
+                obdCommands.add(new ObdCommandJob(new EngineOilTempObdCommand()));
+                obdCommands.add(new ObdCommandJob(new FuelLevelObdCommand()));
+                obdCommands.add(new ObdCommandJob(new DistanceTraveledSinceCodesClearedObdCommand()));
+                obdCommands.add(new ObdCommandJob(new FuelConsumptionRateObdCommand()));
+                obdCommands.add(new ObdCommandJob(new EngineRuntimeObdCommand()));
+                obdCommands.add(new ObdCommandJob(new EngineFuelRate()));
+                obdCommands.add(new ObdCommandJob(new EngineRuntimeObdCommand()));
 
                 Log.d(TAG, "Initialization jobs added to list.");
             }
+        }
+    }
+
+    private class MyLocationListener implements android.location.LocationListener {
+
+        public MyLocationListener(String provider) {
+            Log.i(TAG, "LocationListener " + provider);
+            location = new Location(provider);
+            Log.i(TAG, " Location is:" + (location.getLatitude() + " " + location.getLongitude()));
+        }
+
+        @Override
+        public void onLocationChanged(Location location) {
+            Log.e(TAG, "onLocationChanged: " + location);
+            ObdGatewayService.this.location.set(location);
+            ObdGatewayService.this.location = location;
+            Log.i(TAG, " Location is:" + (location.getLatitude() + " " + location.getLongitude()));
+        }
+
+        @Override
+        public void onProviderDisabled(String provider) {
+            Log.e(TAG, "onProviderDisabled: " + provider);
+        }
+
+        @Override
+        public void onProviderEnabled(String provider) {
+            Log.e(TAG, "onProviderEnabled: " + provider);
+        }
+
+        @Override
+        public void onStatusChanged(String provider, int status, Bundle extras) {
+            Log.e(TAG, "onStatusChanged: " + provider);
         }
     }
 }

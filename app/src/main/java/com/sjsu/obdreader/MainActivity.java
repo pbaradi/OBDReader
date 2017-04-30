@@ -1,28 +1,25 @@
 package com.sjsu.obdreader;
 
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.os.Bundle;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.View;
+import android.widget.Button;
 
 public class MainActivity extends AppCompatActivity {
 
-    private IntentFilter filter;
     Intent intent;
+    Button start;
+    Button stop;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        //setContentView(R.layout.activity_main);
-
-        //intent = new Intent(getBaseContext(), OBDReaderService.class);
-        intent = new Intent(getBaseContext(),ObdGatewayService.class);
-
-        startService(intent);
-        finish();
+        setContentView(R.layout.activity_main);
+        addListenerOnButton();
     }
 
     @Override
@@ -50,14 +47,41 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        Log.i("MainActivity","onDestroy");
-        //stopService(intent);
+        Log.i("MainActivity", "onDestroy");
+        if (null != intent)
+            stopService(intent);
     }
 
     @Override
     protected void onStop() {
         super.onStop();
         Log.i("MainActivity", "onStop");
-        //stopService(intent);
+//        if (intent != null)
+//            stopService(intent);
     }
+
+    public void addListenerOnButton() {
+        start = (Button) findViewById(R.id.button1);
+        start.setOnClickListener(new View.OnClickListener() {
+
+            @Override
+            public void onClick(View arg0) {
+                intent = new Intent(getBaseContext(), ObdGatewayService.class);
+                startService(intent);
+            }
+        });
+
+        stop = (Button) findViewById(R.id.button2);
+        stop.setOnClickListener(new View.OnClickListener() {
+
+            @Override
+            public void onClick(View arg0) {
+                if (null != intent)
+                    stopService(intent);
+            }
+        });
+
+    }
+
+
 }

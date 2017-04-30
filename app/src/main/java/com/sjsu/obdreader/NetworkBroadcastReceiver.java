@@ -7,20 +7,45 @@ import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.util.Log;
 
+import com.sjsu.obdreader.db.VehicleDataSource;
+import com.sjsu.obdreader.model.VehicleLog;
+
+import java.util.List;
+
 public class NetworkBroadcastReceiver extends BroadcastReceiver {
+    VehicleDataSource vehicleDataSource;
+    MQTTHelper helper;
+
+
     public NetworkBroadcastReceiver() {
     }
 
     @Override
     public void onReceive(Context context, Intent intent) {
         // TODO: This method is called when the BroadcastReceiver is receiving
-        // an Intent broadcast.
+        Log.i("NETWORK", "onReceive");
         ConnectivityManager connectivityManager = (ConnectivityManager)
-                context.getSystemService(Context.CONNECTIVITY_SERVICE );
+                context.getSystemService(Context.CONNECTIVITY_SERVICE);
         NetworkInfo activeNetInfo = connectivityManager.getActiveNetworkInfo();
-        boolean isConnected = activeNetInfo != null && activeNetInfo.isConnectedOrConnecting();
-        if (isConnected)
-            Log.i("NET", "connected" + isConnected);
-        else Log.i("NET", "not connected" +isConnected);
+
+        if (activeNetInfo != null && activeNetInfo.isConnectedOrConnecting()) {
+            ObdGatewayService.isConnected = true;
+            helper = new MQTTHelper(context);
+            vehicleDataSource = new VehicleDataSource(context);
+//            vehicleDataSource.open();
+
+            List<VehicleLog> vLog = vehicleDataSource.getVehicleLog();
+            for (VehicleLog vehicle : vLog) {
+                helper.publishData(vehicle);
+            }
+            vehicleDataSource.deleteData();
+//            List<VehicleLog> vLogs = vehicleDataSource.getVehicleLog();
+            Log.i("NET", "connected" + ObdGatewayService.isConnected);
+        } else {
+            ObdGatewayService.isConnected = false;
+            if (vehicleDataSource != null)
+                vehicleDataSource.close();
+            Log.i("NET", "not connected" + ObdGatewayService.isConnected);
+        }
     }
 }
